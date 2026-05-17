@@ -1,3 +1,9 @@
+"""
+NEXUS ALPR API - Enterprise Edition
+Main FastAPI Application Engine
+Handles ML Inference (YOLOv8, ONNX), WebSockets, and routing for the ALPR system.
+"""
+
 from fastapi import FastAPI, File, UploadFile, Form, WebSocket, WebSocketDisconnect, Body
 from fastapi.responses import StreamingResponse, Response
 import cv2
@@ -18,10 +24,17 @@ from api.database import (
     init_db, log_entry, checkout_vehicle, add_new_subscriber, 
     get_all_visits, check_blacklist, add_to_blacklist, get_occupancy,
     log_security_alert, get_today_alerts_count, manual_log_entry, 
-    update_visit_db, void_visit_db, waive_fee_db, get_blacklist_data, get_alerts_data, remove_from_blacklist_db, mark_all_alerts_read, get_vip_dashboard_data, remove_vip_db, update_vip_db, export_daily_report_csv, get_full_dashboard_analytics, get_system_settings_db, update_system_settings_db
+    update_visit_db, void_visit_db, waive_fee_db, get_blacklist_data, 
+    get_alerts_data, remove_from_blacklist_db, mark_all_alerts_read, 
+    get_vip_dashboard_data, remove_vip_db, update_vip_db, export_daily_report_csv, 
+    get_full_dashboard_analytics, get_system_settings_db, update_system_settings_db
 )
 
-app = FastAPI(title="Nexus ALPR")
+# ==========================================
+# ⚙️ 1. APP CONFIGURATION & MODELS INITIALIZATION
+# ==========================================
+
+app = FastAPI(title="Nexus ALPR API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,6 +52,7 @@ ocr_model = YOLO('models/ocr_model.onnx')
 vehicle_model = YOLO('yolov8n.pt') 
 print("All Models Loaded Successfully! 🚀")
 
+# ----------------- Dictionaries -----------------
 arabic_mapping = {
     'alif': 'أ', 'baa': 'ب', 'taa': 'ت', 'thaa': 'ث', 'jeem': 'ج',
     '7aa': 'ح', 'khaa': 'خ', 'daal': 'د', 'zaal': 'ذ', 'raa': 'ر',
@@ -57,13 +71,26 @@ letter_to_number = {
     'أ': '1', 'هـ': '5', 'ه': '5', 'o': '5', 'د': '2', 'و': '9', 'ط': '6'
 }
 
+
+# ==========================================
+# 🧠 2. CORE ML & LOGIC PIPELINES
+# ==========================================
+
 def correct_plate_logic(detected_chars):
+    """
+    Normalizes and corrects misclassified characters based on Egyptian license plate standards.
+    Args:
+        detected_chars (list): List of detected character dictionaries.
+    Returns:
+        str: Formatted and normalized license plate string.
+    """
     corrected_plate = []
     total_chars = len(detected_chars)
     
     for i, item in enumerate(detected_chars):
         char = item["name"]
         
+        # Apply spatial correction only for standard 5+ character plates
         if total_chars >= 5:
             if i < 2: 
                 if char in number_to_letter:
@@ -86,11 +113,15 @@ def correct_plate_logic(detected_chars):
     
     return normalized_plate_text
 
-# ==========================================
-# 🧠 AI HELPER FUNCTION (WITH CLASSIFICATION)
-# ==========================================
 
 def extract_plates_from_frame(img):
+    """
+    Executes the full AI pipeline: Vehicle detection -> Plate isolation -> Image Enhancement -> OCR.
+    Args:
+        img (numpy.ndarray): The raw image frame.
+    Returns:
+        list: Extracted vehicle types and formatted license plate strings.
+    """
     detected_data = []
     
     vehicle_results = vehicle_model.predict(img, classes=[2, 3, 5, 7], conf=0.5, verbose=False)
@@ -162,10 +193,15 @@ def extract_plates_from_frame(img):
             
     return detected_data
 
-# ==========================================
-# 🛑 SECURITY HELPER FUNCTION
-# ==========================================
 def process_plate_with_security(plate_data, gate):
+    """
+    Validates the detected plate against the security blacklist and updates the gate logs.
+    Args:
+        plate_data (dict): Contains 'plate' and 'type'.
+        gate (str): Gate type ('in' or 'out').
+    Returns:
+        dict: Operational result or security alert.
+    """
     plate = plate_data["plate"]
     v_type = plate_data["type"]
     
@@ -185,11 +221,14 @@ def process_plate_with_security(plate_data, gate):
     elif gate == 'out':
         return checkout_vehicle(plate)
 
+
 # ==========================================
-# 📸 1. IMAGE PROCESSING ENDPOINT
+# 🌐 3. COMPUTER VISION API ENDPOINTS
 # ==========================================
+
 @app.post("/process_vehicle")
 async def process_vehicle(gate: str = Form(...), file: UploadFile = File(...)):
+    """ Endpoint to process a single static image uploaded via multipart/form-data. """
     if gate not in ['in', 'out']:
         return {"status": "error", "message": "Invalid gate type. Must be 'in' or 'out'."}
 
@@ -216,11 +255,10 @@ async def process_vehicle(gate: str = Form(...), file: UploadFile = File(...)):
     else:
         return {"status": "error", "message": "No valid license plates found in the image."}
 
-# ==========================================
-# 🎥 2. VIDEO PROCESSING ENDPOINT
-# ==========================================
+
 @app.post("/process_video")
 async def process_video(gate: str = Form(...), file: UploadFile = File(...)):
+    """ Endpoint to process an uploaded video file, applying frame skipping for performance. """
     if gate not in ['in', 'out']:
         return {"status": "error", "message": "Invalid gate type."}
 
@@ -262,11 +300,10 @@ async def process_video(gate: str = Form(...), file: UploadFile = File(...)):
     else:
         return {"status": "error", "message": "No valid plates found in video."}
 
-# ==========================================
-# 🔴 3. LIVE CAMERA WEBSOCKET
-# ==========================================
+
 @app.websocket("/ws/live_camera/{gate}")
 async def live_camera(websocket: WebSocket, gate: str):
+    """ Real-time WebSocket endpoint for continuous video stream inference. """
     await websocket.accept()
     
     if gate not in ['in', 'out']:
@@ -304,15 +341,14 @@ async def live_camera(websocket: WebSocket, gate: str):
     except WebSocketDisconnect:
         print(f"Live camera feed disconnected for gate: {gate}")
 
-# ==========================================
-# 🖼️ 4. SNAPSHOT ENDPOINT
-# ==========================================
+
 class SnapshotData(BaseModel):
     gate: str
     image_base64: str
 
 @app.post("/process_snapshot")
 async def process_snapshot(data: SnapshotData):
+    """ Endpoint to process an image encoded in Base64 (ideal for WebCams/IoT devices). """
     if data.gate not in ['in', 'out']:
         return {"status": "error", "message": "Invalid gate type."}
 
@@ -344,25 +380,19 @@ async def process_snapshot(data: SnapshotData):
     except Exception as e:
         return {"status": "error", "message": f"Error processing snapshot: {str(e)}"}
 
+
 # ==========================================
-# 🛠️ GENERAL & ADMIN ENDPOINTS
+# 📊 4. DASHBOARD & SYSTEM ENDPOINTS
 # ==========================================
+
 @app.get("/")
 def read_root():
+    """ Health Check endpoint. """
     return {"message": "Welcome to OmniBoard ALPR API - Enterprise Edition is Online 🟢"}
-    
-@app.post("/add_vip")
-def add_vip(plate_number: str = Form(...), owner_name: str = Form(...)):
-    result = add_new_subscriber(plate_number, owner_name)
-    return result
-
-@app.post("/add_to_blacklist")
-def add_blacklist_entry(plate_number: str = Form(...), reason: str = Form(...)):
-    result = add_to_blacklist(plate_number, reason)
-    return result
 
 @app.get("/live_status")
 def get_live_status():
+    """ Fetches real-time occupancy and active security alerts. """
     occupancy_data = get_occupancy()
     alerts_count = get_today_alerts_count()
     return {
@@ -372,34 +402,128 @@ def get_live_status():
         "active_alerts": alerts_count
     }
 
-@app.get("/export_report")
-def export_report():
+@app.get("/analytics/dashboard")
+def get_dashboard_analytics():
+    """ Aggregates core system analytics for the main dashboard. """
+    return get_full_dashboard_analytics()
+
+@app.get("/visits")
+def get_visits_json():
+    """ Retrieves all historical vehicle visits. """
     rows = get_all_visits()
-    stream = StringIO()
-    writer = csv.writer(stream)
-    
-    writer.writerow(["Plate Number", "Vehicle Type", "Entry Time", "Exit Time", "Status", "Fee (EGP)"])
-    
-    for row in rows:
-        writer.writerow(row[:6])
-        
-    response = StreamingResponse(iter([stream.getvalue()]), media_type="text/csv")
-    response.headers["Content-Disposition"] = "attachment; filename=omniboard_daily_report.csv"
-    return response
+    visits = []
+    for r in rows:
+        visits.append({
+            "plate_number": r[0], "vehicle_type": r[1], "entry_time": r[2], 
+            "exit_time": r[3], "status": r[4], "fee": r[5], "id": r[6] 
+        })
+    return {"status": "success", "data": visits}
+
+# --- Analytics Sub-Endpoints ---
+@app.get("/analytics/peak_hours")
+def analytics_peak_hours():
+    try:
+        return {"status": "success", "description": "Traffic peak hours analysis", "data": get_peak_hours()}
+    except Exception as e:
+        return {"status": "error", "message": f"Could not fetch analytics: {str(e)}"}
+
+@app.get("/analytics/revenue")
+def analytics_revenue():
+    try:
+        return {"status": "success", "currency": "EGP", "data": get_revenue_analytics()}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.get("/analytics/dwell_time")
+def analytics_dwell_time():
+    try:
+        return {"status": "success", "unit": "hours", "data": get_dwell_time_analytics()}
+    except Exception as e:
+        return {"status": "error", "message": f"Could not fetch dwell time: {str(e)}"}
+
 
 # ==========================================
-# ⚙️ ADMIN ACTION ENDPOINTS (NEW)
+# 🛡️ 5. SECURITY & BLACKLIST MANAGEMENT
 # ==========================================
+
+@app.get("/security/blacklist")
+def fetch_blacklist():
+    return {"status": "success", "data": get_blacklist_data()}
+
+@app.post("/add_to_blacklist")
+def add_blacklist_entry(plate_number: str = Form(...), reason: str = Form(...)):
+    """ Adds a vehicle to the security blacklist via Form submission. """
+    return add_to_blacklist(plate_number, reason)
+
+@app.delete("/security/blacklist/{plate_number}")
+def delete_blacklist_record(plate_number: str):
+    return remove_from_blacklist_db(plate_number)
+
+@app.get("/security/alerts")
+def fetch_security_alerts():
+    return {"status": "success", "data": get_alerts_data()}
+
+@app.put("/security/alerts/read")
+def mark_alerts_as_read():
+    return mark_all_alerts_read()
+
+
+# ==========================================
+# 🌟 6. VIP / SUBSCRIBER MANAGEMENT
+# ==========================================
+
+class VIPCreate(BaseModel):
+    plate_number: str
+    owner_name: str
+
+class VIPUpdate(BaseModel):
+    old_plate: str
+    new_plate: str
+    owner_name: str
+    status: str
+
+@app.get("/vips")
+def get_all_vips():
+    return get_vip_dashboard_data()
+
+@app.post("/vip/add")
+def add_vip_endpoint(vip: VIPCreate):
+    """ Adds a VIP record via JSON payload. """
+    return add_new_subscriber(vip.plate_number, vip.owner_name)
+
+@app.post("/add_vip")
+def add_vip(plate_number: str = Form(...), owner_name: str = Form(...)):
+    """ Legacy endpoint: Adds a VIP record via Form submission. """
+    return add_new_subscriber(plate_number, owner_name)
+
+@app.put("/vip/update")
+def update_vip_endpoint(vip: VIPUpdate):
+    return update_vip_db(vip.old_plate, vip.new_plate, vip.owner_name, vip.status)
+
+@app.delete("/vips/{plate_number}")
+def delete_vip(plate_number: str):
+    return remove_vip_db(plate_number)
+
+
+# ==========================================
+# 🛠️ 7. ADMIN ACTIONS & GATE CONTROLS
+# ==========================================
+
 @app.post("/admin/manual_entry")
 def admin_manual_entry(plate_number: str = Form(...), vehicle_type: str = Form(...)):
+    """ Allows manual gate override while enforcing blacklist checks. """
     clean_plate = " ".join(plate_number.split())
-    
     bl_reason = check_blacklist(clean_plate)
     if bl_reason:
         log_security_alert(clean_plate, f"Manual Entry Blocked: {bl_reason}")
         return {"status": "error", "message": f"ACCESS DENIED: Vehicle is Blacklisted! Reason: {bl_reason}"}
         
     return manual_log_entry(clean_plate, vehicle_type)
+
+@app.post("/admin/force_exit")
+def admin_force_exit(data: dict = Body(...)):
+    plate_number = data.get("plate_number")
+    return checkout_vehicle(plate_number)
 
 @app.post("/admin/update_visit")
 def admin_update_visit(visit_id: int = Body(...), data: dict = Body(...)):
@@ -413,106 +537,30 @@ def admin_void_visit(visit_id: int = Body(...), reason: str = Body(...)):
 def admin_waive_fee(visit_id: int = Body(...), reason: str = Body(...)):
     return waive_fee_db(visit_id, reason)
 
-@app.post("/admin/force_exit")
-def admin_force_exit(data: dict = Body(...)):
-    plate_number = data.get("plate_number")
-    return checkout_vehicle(plate_number)
 
 # ==========================================
-# 📊 DATA ANALYTICS ENDPOINTS
+# 📈 8. EXPORTS & SYSTEM SETTINGS
 # ==========================================
-@app.get("/analytics/peak_hours")
-def analytics_peak_hours():
-    try:
-        data = get_peak_hours()
-        return {"status": "success", "description": "Traffic peak hours analysis", "data": data}
-    except Exception as e:
-        return {"status": "error", "message": f"Could not fetch analytics: {str(e)}"}
-
-@app.get("/analytics/revenue")
-def analytics_revenue():
-    try:
-        data = get_revenue_analytics()
-        return {"status": "success", "currency": "EGP", "data": data}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-@app.get("/analytics/dwell_time")
-def analytics_dwell_time():
-    try:
-        data = get_dwell_time_analytics()
-        return {"status": "success", "unit": "hours", "data": data}
-    except Exception as e:
-        return {"status": "error", "message": f"Could not fetch dwell time: {str(e)}"}
-
-@app.get("/visits")
-def get_visits_json():
-    rows = get_all_visits()
-    
-    visits = []
-    for r in rows:
-        visits.append({
-            "plate_number": r[0], 
-            "vehicle_type": r[1], 
-            "entry_time": r[2], 
-            "exit_time": r[3], 
-            "status": r[4], 
-            "fee": r[5],
-            "id": r[6] 
-        })
-        
-    return {"status": "success", "data": visits}
-
-@app.get("/security/blacklist")
-def fetch_blacklist():
-    return {"status": "success", "data": get_blacklist_data()}
-
-@app.get("/security/alerts")
-def fetch_security_alerts():
-    return {"status": "success", "data": get_alerts_data()}
-
-@app.delete("/security/blacklist/{plate_number}")
-def delete_blacklist_record(plate_number: str):
-    return remove_from_blacklist_db(plate_number)
-
-@app.put("/security/alerts/read")
-def mark_alerts_as_read():
-    return mark_all_alerts_read()
-
-@app.get("/vips")
-def get_all_vips():
-    return get_vip_dashboard_data()
-
-@app.delete("/vips/{plate_number}")
-def delete_vip(plate_number: str):
-    return remove_vip_db(plate_number)
-
-class VIPCreate(BaseModel):
-    plate_number: str
-    owner_name: str
-
-@app.post("/vip/add")
-def add_vip_endpoint(vip: VIPCreate):
-    return add_new_subscriber(vip.plate_number, vip.owner_name)
-
-class VIPUpdate(BaseModel):
-    old_plate: str
-    new_plate: str
-    owner_name: str
-    status: str
-
-@app.put("/vip/update")
-def update_vip_endpoint(vip: VIPUpdate):
-    return update_vip_db(vip.old_plate, vip.new_plate, vip.owner_name, vip.status)
-
-@app.get("/analytics/dashboard")
-def get_dashboard_analytics():
-    return get_full_dashboard_analytics()
 
 @app.get("/analytics/export")
 def export_csv_report():
+    """ Triggers a file download containing daily analytics (CSV). """
     csv_data = export_daily_report_csv()
     return Response(content=csv_data, media_type="text/csv", headers={"Content-Disposition": 'attachment; filename="daily_report.csv"'})
+
+@app.get("/export_report")
+def export_report():
+    """ Legacy CSV stream export for basic visits data. """
+    rows = get_all_visits()
+    stream = StringIO()
+    writer = csv.writer(stream)
+    writer.writerow(["Plate Number", "Vehicle Type", "Entry Time", "Exit Time", "Status", "Fee (EGP)"])
+    for row in rows:
+        writer.writerow(row[:6])
+        
+    response = StreamingResponse(iter([stream.getvalue()]), media_type="text/csv")
+    response.headers["Content-Disposition"] = "attachment; filename=omniboard_daily_report.csv"
+    return response
 
 class SettingsModel(BaseModel):
     max_capacity: int
