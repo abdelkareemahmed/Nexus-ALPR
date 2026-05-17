@@ -1,6 +1,7 @@
 venv/
+node_modules/
+frontend/
 __pycache__/
 .env
-test_images/
-runs/
 *.pyc
+.git/
