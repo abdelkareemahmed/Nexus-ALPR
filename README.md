@@ -66,7 +66,7 @@ nexus-alpr/
 
 The system is fully containerized and deployed across premier cloud platforms:
 
-- **🖥️ Admin Dashboard (Frontend):** [View on Netlify](https://darling-scone-206bbc.netlify.app/)
+- **🖥️ Admin Dashboard (Frontend):** [View on Netlify](https://nexusalpr.netlify.app/)
 - **⚙️ AI Inference API (Backend):** [View on Hugging Face Spaces](https://huggingface.co/spaces/abdelkareem1/nexus-alpr-api/)
 - **💾 Database:** Hosted securely on **Neon Cloud (PostgreSQL)**.
 
