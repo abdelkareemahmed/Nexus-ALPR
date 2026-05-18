@@ -745,7 +745,7 @@ const NAV = [
 ];
 
 function Sidebar({ page, setPage }) {
-  const { liveStatus, alertsCount, setAlertsCount } = useContext(AppCtx);
+  const { liveStatus, alertsCount, setAlertsCount, isProcessingMedia } = useContext(AppCtx);
   const { toasts, show: showSidebarToast, dismiss: dismissSidebar } = useToast();
 
   // ── Reset badge instantly when Security page clears all alerts ────────────
@@ -763,6 +763,7 @@ function Sidebar({ page, setPage }) {
 
   // ── Poll /live_status every 8 s to keep the sidebar bar truly live ─────────
   useEffect(() => {
+    if (isProcessingMedia) return; // ← pause during upload; cleanup auto-clears the old interval
     const BASE = import.meta.env.VITE_API_BASE_URL;
     if (!BASE) return;
 
@@ -801,13 +802,14 @@ function Sidebar({ page, setPage }) {
     fetchOccupancy();                                 // run immediately on mount
     const id = setInterval(fetchOccupancy, 8_000);   // then every 8 s
     return () => clearInterval(id);                   // clean up on unmount
-  }, []);                                             // no deps — BASE is a build constant
+  }, [isProcessingMedia]);                                             // no deps — BASE is a build constant
 
   // ── Poll /security/alerts every 5 s — badge = unread count only ───────────
   // This is the ONLY source of truth for the badge. It does NOT use
   // /live_status or any general dashboard stat, so "Today's Alerts" (a
   // cumulative total) can never bleed into the unread indicator.
   useEffect(() => {
+    if (isProcessingMedia) return; // ← pause during upload
     const BASE = import.meta.env.VITE_API_BASE_URL;
     if (!BASE) return;
 
@@ -835,7 +837,7 @@ function Sidebar({ page, setPage }) {
     fetchUnread();                                   // run immediately on mount
     const id = setInterval(fetchUnread, 5_000);      // then every 5 s
     return () => clearInterval(id);                  // clean up on unmount
-  }, [setAlertsCount]);
+  }, [setAlertsCount, isProcessingMedia]);
   // occupancy, capacity and pct are now driven by the dedicated poller above —
   // the context liveStatus value is kept for any other consumers but is no
   // longer used to render the sidebar minibar.
@@ -2499,6 +2501,7 @@ function CameraPanel({ label, isEntry, logs, loading, onOpenGate, onImageUpload,
 
 function PageGates() {
   const BASE = import.meta.env.VITE_API_BASE_URL;
+  const { setIsProcessingMedia } = useContext(AppCtx);
 
   // ── Toast ──────────────────────────────────────────────────────────────────
   const { toasts, show: showToast, dismiss } = useToast();
@@ -2647,6 +2650,7 @@ function PageGates() {
   const handleImageUpload = useCallback(async (gateId, file) => {
     const setImgBusy = gateId === "in" ? setImgBusyIn : setImgBusyOut;
     setImgBusy(true);
+    setIsProcessingMedia(true);
     try {
       const fd = new FormData();
       fd.append("gate", gateId);
@@ -2675,8 +2679,9 @@ function PageGates() {
       showToast(`Image upload failed: ${e.message}`, "error");
     } finally {
       setImgBusy(false);
+      setIsProcessingMedia(false);
     }
-  }, [BASE, showToast, refetchVisits]);
+  }, [BASE, showToast, refetchVisits, setIsProcessingMedia]);
 
   /**
    * handleVideoUpload(gateId, file)
@@ -2691,6 +2696,7 @@ function PageGates() {
   const handleVideoUpload = useCallback(async (gateId, file) => {
     const setVidBusy = gateId === "in" ? setVidBusyIn : setVidBusyOut;
     setVidBusy(true);
+    setIsProcessingMedia(true); 
     try {
       const fd = new FormData();
       fd.append("gate", gateId);
@@ -2719,8 +2725,9 @@ function PageGates() {
       showToast(`Video upload failed: ${e.message}`, "error");
     } finally {
       setVidBusy(false);
+      setIsProcessingMedia(false); 
     }
-  }, [BASE, showToast, refetchVisits]);
+  }, [BASE, showToast, refetchVisits, setIsProcessingMedia]);
 
   // ── Manual Entry modal (same flow as PageOverview) ────────────────────────
   const [manualOpen,    setManualOpen]    = useState(false);
@@ -4658,9 +4665,10 @@ function PageSecurity() {
 // ROOT APP
 // ─────────────────────────────────────────────────────────────────────────────
 export default function App() {
-  const [page, setPage]           = useState("overview");
-  const [alertsCount, setAlertsCount] = useState(0);
-  const [searchQuery, setSearchQuery] = useState("");
+  const [page, setPage]                       = useState("overview");
+const [alertsCount, setAlertsCount]         = useState(0);
+const [searchQuery, setSearchQuery]         = useState("");
+const [isProcessingMedia, setIsProcessingMedia] = useState(false);
 
   // Poll live status every 30s
   const { data: liveStatus } = useFetch(`${API_BASE}/live_status`, { enabled: !!API_BASE });
@@ -4673,7 +4681,7 @@ export default function App() {
     return () => el.remove();
   }, []);
 
-  const ctx = { liveStatus, alertsCount, setAlertsCount, searchQuery, setSearchQuery, setPage };
+  const ctx = { liveStatus, alertsCount, setAlertsCount, searchQuery, setSearchQuery, setPage, isProcessingMedia, setIsProcessingMedia };
 
   const pages = { overview: PageOverview, gates: PageGates, analytics: PageAnalytics, vip: PageVIP, security: PageSecurity };
   const PageComponent = pages[page] ?? PageOverview;
