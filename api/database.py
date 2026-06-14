@@ -11,22 +11,31 @@ import csv
 import io
 from datetime import datetime, timedelta
 
+# Load environment variables (Database Connection String)
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 # ==========================================
-# ⚙️ 1. SETUP & UTILITIES
+# ⚙️ 1. DATABASE SETUP & UTILITIES
 # ==========================================
 
 def get_connection():
-    """Establishes and returns a connection to the PostgreSQL database."""
+    """
+    Establishes and returns a connection to the PostgreSQL database.
+    Ensures connection pooling capabilities for high-throughput ALPR inference.
+    """
     return psycopg2.connect(DATABASE_URL)
 
 def init_db():
-    """Initializes the database schema, creating necessary tables and default settings."""
+    """
+    Initializes the database schema ensuring idempotency (IF NOT EXISTS).
+    Sets up core tables, constraints, default configurations, and alters existing tables
+    to seamlessly handle schema migrations without data loss.
+    """
     conn = get_connection()
     cursor = conn.cursor()
     
+    # VIP Subscribers Table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS subscribers (
             id SERIAL PRIMARY KEY,
@@ -35,6 +44,7 @@ def init_db():
         )
     ''')
     
+    # Core Operations Logging Table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS visits (
             id SERIAL PRIMARY KEY,
@@ -48,6 +58,7 @@ def init_db():
         )
     ''')
     
+    # Security: Blacklisted Vehicles
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS blacklist (
             id SERIAL PRIMARY KEY,
@@ -57,6 +68,7 @@ def init_db():
         )
     ''')
 
+    # Security: Triggered Alerts Log
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS security_alerts (
             id SERIAL PRIMARY KEY,
@@ -66,6 +78,7 @@ def init_db():
         )
     ''')
 
+    # Global System Settings
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             id SERIAL PRIMARY KEY,
@@ -74,12 +87,14 @@ def init_db():
         );
     """)
 
+    # Seed default settings if the table is empty
     cursor.execute("""
         INSERT INTO settings (id, max_capacity, hourly_rate)
         SELECT 1, 50, 20
         WHERE NOT EXISTS (SELECT 1 FROM settings WHERE id = 1);
     """)
 
+    # Schema Alterations (Safe Migrations for legacy databases)
     cursor.execute("ALTER TABLE visits ADD COLUMN IF NOT EXISTS vehicle_type TEXT DEFAULT 'car';")
     cursor.execute("ALTER TABLE visits ADD COLUMN IF NOT EXISTS notes TEXT;")
     cursor.execute("ALTER TABLE security_alerts ADD COLUMN IF NOT EXISTS is_read BOOLEAN DEFAULT FALSE;")
@@ -93,18 +108,22 @@ def init_db():
 
 def normalize_plate(plate_text):
     """
-    Cleans and normalizes Arabic license plate text for accurate database matching.
-    Handles variations in Arabic characters (e.g., Alif, Yaa, Haa) and standardizes numerals.
+    Data Sanitization: Cleans and normalizes Arabic license plate text.
+    Critical for reliable database querying, handling variations in Arabic typography
+    (e.g., Alif, Yaa, Haa) and standardizing numerals to prevent duplicate or missed matches.
     """
     if not plate_text: return ""
     
+    # Standardize Arabic characters
     text = plate_text.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا")
     text = text.replace("هـ", "ه").replace("ة", "ه")
     text = text.replace("ى", "ي")
     
+    # Convert Arabic/Hindi numerals to standard digits
     trans = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
     text = text.translate(trans)
     
+    # Strip whitespaces for exact DB matching
     text = text.replace(" ", "")
     
     letters = "".join([c for c in text if c.isalpha()])
@@ -114,13 +133,16 @@ def normalize_plate(plate_text):
 
 
 # ==========================================
-# 🅿️ 2. CORE PARKING OPERATIONS
+# 🅿️ 2. CORE PARKING OPERATIONS (TRANSACTIONS)
 # ==========================================
 
 def log_entry(plate_number, vehicle_type="car"):
     """
-    Logs a new vehicle entry into the parking facility.
-    Performs security blacklist checks and capacity validation before logging.
+    Ingress Transaction Handler:
+    1. Validates against the security blacklist.
+    2. Checks for active inside entries to prevent duplicate state logging.
+    3. Validates current occupancy against maximum system capacity.
+    4. Logs the entry and checks VIP status.
     """
     bl_reason = check_blacklist(plate_number)
     if bl_reason:
@@ -130,12 +152,14 @@ def log_entry(plate_number, vehicle_type="car"):
     conn = get_connection()
     cursor = conn.cursor()
     
+    # Duplicate entry check
     cursor.execute("SELECT id FROM visits WHERE plate_number = %s AND status = 'inside'", (plate_number,))
     if cursor.fetchone():
         cursor.close()
         conn.close()
         return {"status": "warning", "message": "Vehicle is already inside the parking lot."}
         
+    # Capacity validation
     occupancy = get_occupancy()
     if occupancy["is_full"]:
         cursor.close()
@@ -152,6 +176,7 @@ def log_entry(plate_number, vehicle_type="car"):
         (plate_number, vehicle_type, now)
     )
     
+    # VIP Check
     cursor.execute("SELECT owner_name FROM subscribers WHERE plate_number = %s", (plate_number,))
     sub = cursor.fetchone()
     
@@ -166,8 +191,9 @@ def log_entry(plate_number, vehicle_type="car"):
 
 def checkout_vehicle(plate_number):
     """
-    Processes a vehicle's exit, calculates the dwell time, and computes the required parking fee.
-    Waives fees for VIP subscribers.
+    Egress Transaction Handler:
+    Calculates dwell time and computes dynamic parking fees based on vehicle classification.
+    Automatically waives fees for VIP subscribers.
     """
     conn = get_connection()
     cursor = conn.cursor()
@@ -183,11 +209,14 @@ def checkout_vehicle(plate_number):
     visit_id, entry_time_str, vehicle_type = record
     now = datetime.now()
     entry_time = datetime.strptime(entry_time_str, "%Y-%m-%d %H:%M:%S")
+    
+    # Minimum billable time is 1 hour
     hours = max((now - entry_time).total_seconds() / 3600, 1.0) 
     
     cursor.execute("SELECT id FROM subscribers WHERE plate_number = %s", (plate_number,))
     is_sub = cursor.fetchone()
     
+    # Dynamic Pricing Engine based on vehicle class
     hourly_rates = {
         "motorcycle": 10,
         "car": 20,
@@ -219,7 +248,7 @@ def checkout_vehicle(plate_number):
     }
 
 def get_all_visits():
-    """Retrieves all historical visits excluding voided records."""
+    """Retrieves all historical visits excluding voided records for operational logging."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT plate_number, vehicle_type, entry_time, exit_time, status, fee, id FROM visits WHERE status != 'void' ORDER BY id DESC")
@@ -230,7 +259,7 @@ def get_all_visits():
     return rows
 
 def get_occupancy():
-    """Calculates current parking occupancy and checks against system capacity limits."""
+    """Calculates real-time parking occupancy against the dynamically configured system capacity."""
     conn = get_connection()
     cursor = conn.cursor()
     
@@ -258,7 +287,10 @@ def get_occupancy():
 # ==========================================
 
 def check_blacklist(plate_number):
-    """Cross-references a plate number against the security blacklist (uses normalized strings)."""
+    """
+    Cross-references a plate number against the security blacklist.
+    Utilizes plate normalization to catch bad actors attempting OCR evasion.
+    """
     conn = get_connection()
     cursor = conn.cursor()
     
@@ -330,7 +362,7 @@ def log_security_alert(plate_number, reason):
     conn.close()
 
 def get_alerts_data():
-    """Fetches up to 50 recent unread security alerts."""
+    """Fetches up to 50 recent unread security alerts for the Admin Dashboard."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT plate_number, reason, timestamp FROM security_alerts WHERE is_read = FALSE ORDER BY id DESC LIMIT 50")
@@ -340,7 +372,7 @@ def get_alerts_data():
     return [{"plate_number": r[0], "reason": r[1], "timestamp": r[2]} for r in rows]
 
 def get_today_alerts_count():
-    """Returns the total number of security alerts triggered today."""
+    """Returns the total number of security alerts triggered during the current date."""
     conn = get_connection()
     cursor = conn.cursor()
     today = datetime.now().strftime("%Y-%m-%d")
@@ -351,7 +383,7 @@ def get_today_alerts_count():
     return count
 
 def mark_all_alerts_read():
-    """Marks all pending security alerts as read/acknowledged."""
+    """Batch updates all pending security alerts as acknowledged/read."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("UPDATE security_alerts SET is_read = TRUE WHERE is_read = FALSE")
@@ -366,7 +398,7 @@ def mark_all_alerts_read():
 # ==========================================
 
 def add_new_subscriber(plate_number, owner_name):
-    """Registers a new VIP/Subscriber to bypass parking fees."""
+    """Registers a new VIP/Subscriber to bypass operational parking fees."""
     conn = get_connection()
     cursor = conn.cursor()
     
@@ -387,7 +419,10 @@ def add_new_subscriber(plate_number, owner_name):
     return response
 
 def get_vip_dashboard_data():
-    """Aggregates VIP subscriber data including their total historical visits."""
+    """
+    Data Aggregation: Joins subscriber data with historical visits to generate
+    usage analytics for the VIP management dashboard.
+    """
     conn = get_connection()
     cursor = conn.cursor()
     
@@ -437,7 +472,7 @@ def get_vip_dashboard_data():
     }
 
 def update_vip_db(old_plate, new_plate, owner_name, status):
-    """Updates existing VIP subscriber information."""
+    """Updates existing VIP subscriber metadata."""
     conn = get_connection()
     cursor = conn.cursor()
     try:
@@ -467,11 +502,14 @@ def remove_vip_db(plate_number):
 
 
 # ==========================================
-# ⚙️ 5. ADMIN CONTROLS & OVERRIDES
+# 🛠️ 5. ADMIN CONTROLS & OVERRIDES (HUMAN-IN-THE-LOOP)
 # ==========================================
 
 def manual_log_entry(plate_number, vehicle_type, entry_time=None):
-    """Allows administrators to manually inject an entry record, bypassing cameras."""
+    """
+    Human-in-the-loop override: Allows administrators to manually inject an entry 
+    record bypassing ALPR cameras (e.g., muddy plates).
+    """
     conn = get_connection()
     cursor = conn.cursor()
     time_to_log = entry_time if entry_time else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -483,7 +521,10 @@ def manual_log_entry(plate_number, vehicle_type, entry_time=None):
     return {"status": "success", "message": "Manual entry logged successfully."}
 
 def update_visit_db(visit_id, plate_number, vehicle_type, new_status):
-    """Admin utility to forcefully update visit details and dynamically recalculate fees."""
+    """
+    Admin Data Mutation: Forcefully updates visit details.
+    Dynamically recalculates duration and fee if a vehicle is forcefully transitioned to 'outside'.
+    """
     conn = get_connection()
     cursor = conn.cursor()
     
@@ -513,7 +554,7 @@ def update_visit_db(visit_id, plate_number, vehicle_type, new_status):
                 if vip and vip[0].lower() == 'active':
                     fee_to_save = 0  
                 else:
-                    fee_to_save = max(10, round(hours_stayed * 20))
+                    fee_to_save = max(10, round(hours_stayed * 20)) # Uses default generic fallback rate
             except Exception as e:
                 fee_to_save = 0
 
@@ -528,7 +569,7 @@ def update_visit_db(visit_id, plate_number, vehicle_type, new_status):
     return {"status": "success", "message": "Visit updated and fee calculated successfully"}
 
 def void_visit_db(visit_id, reason):
-    """Marks a visit as voided due to errors or manual cancellation."""
+    """Marks a visit as 'void' for data integrity purposes, zeroing out applicable fees."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("UPDATE visits SET status = 'void', fee = 0, notes = %s WHERE id = %s", (f"Voided: {reason}", visit_id))
@@ -538,7 +579,7 @@ def void_visit_db(visit_id, reason):
     return {"status": "success", "message": "Visit successfully voided."}
 
 def waive_fee_db(visit_id, reason):
-    """Zeros out the parking fee for a specific visit."""
+    """Zeros out the operational parking fee for a specific visit."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("UPDATE visits SET fee = 0, notes = %s WHERE id = %s", (f"Fee Waived: {reason}", visit_id))
@@ -554,8 +595,9 @@ def waive_fee_db(visit_id, reason):
 
 def get_full_dashboard_analytics():
     """
-    Compiles extensive business intelligence data including revenue trends, 
-    peak traffic hours, and average dwell times for the admin dashboard.
+    Data Aggregation Engine: Compiles extensive business intelligence metrics.
+    Computes revenue trends, peak traffic distributions (hour-by-hour), 
+    vehicle class distribution, and average dwell times for charting.
     """
     conn = get_connection()
     cursor = conn.cursor()
@@ -638,7 +680,7 @@ def get_full_dashboard_analytics():
     }
 
 def export_daily_report_csv():
-    """Generates a CSV formatted string containing all vehicle operations for the current day."""
+    """Generates a CSV formatted memory buffer containing all transactions for the current date."""
     conn = get_connection()
     cursor = conn.cursor()
     today = datetime.now().strftime("%Y-%m-%d")
@@ -663,7 +705,7 @@ def export_daily_report_csv():
 # ==========================================
 
 def get_system_settings_db():
-    """Retrieves global system configurations like capacity and default rates."""
+    """Retrieves global operational configurations like max capacity and fallback rates."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT max_capacity, hourly_rate FROM settings WHERE id = 1")
@@ -675,7 +717,7 @@ def get_system_settings_db():
     return {"max_capacity": 50, "hourly_rate": 20}
 
 def update_system_settings_db(max_capacity, hourly_rate):
-    """Updates global system configurations."""
+    """Updates global operational configurations via the Admin dashboard."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
