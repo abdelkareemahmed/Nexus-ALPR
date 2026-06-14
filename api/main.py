@@ -11,6 +11,7 @@ import csv
 import re 
 import tempfile
 import os
+import time
 import asyncio
 import base64
 import random
@@ -73,34 +74,52 @@ letter_to_number = {
 
 
 # ==========================================
-# 🧠 2. CORE ML & LOGIC PIPELINES
+# 🧠 2. ML HELPERS & DATA POST-PROCESSING
 # ==========================================
+
+def add_letterbox(img, target_size=320, color=(0, 0, 0)):
+    """
+    Standardizes the input image size for the OCR model without distorting the aspect ratio.
+    Pads the remaining area with a solid color to match training data distribution.
+    """
+    h, w = img.shape[:2]
+    
+    ratio = min(target_size / w, target_size / h)
+    new_w, new_h = int(w * ratio), int(h * ratio)
+    
+    img_resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+    
+    canvas = np.full((target_size, target_size, 3), color, dtype=np.uint8)
+    top = (target_size - new_h) // 2
+    left = (target_size - new_w) // 2
+    canvas[top:top+new_h, left:left+new_w] = img_resized
+    
+    return canvas
 
 def correct_plate_logic(detected_chars):
     """
-    Normalizes and corrects misclassified characters based on Egyptian license plate standards.
-    Args:
-        detected_chars (list): List of detected character dictionaries.
-    Returns:
-        str: Formatted and normalized license plate string.
+    Rule-based character correction utilizing domain knowledge of Egyptian plate layouts.
+    Dynamically separates the 'letters zone' from the 'numbers zone' to fix common OCR misclassifications.
     """
     corrected_plate = []
     total_chars = len(detected_chars)
     
+    # Establish dynamic zone boundaries based on standard plate length
+    letters_zone_limit = 3 if total_chars >= 7 else 2
+    
     for i, item in enumerate(detected_chars):
         char = item["name"]
         
-        # Apply spatial correction only for standard 5+ character plates
         if total_chars >= 5:
-            if i < 2: 
+            if i < letters_zone_limit: 
+                # Letters Zone: Force character representation
                 if char in number_to_letter:
                     char = number_to_letter[char]
-            elif i >= total_chars - 3:
+            else:
+                # Numbers Zone: Force digit representation
                 if char in letter_to_number:
                     char = letter_to_number[char]
-        else:
-            pass
-                
+        
         corrected_plate.append(char)
         
     letters = [c for c in corrected_plate if not c.isdigit()]
@@ -113,10 +132,42 @@ def correct_plate_logic(detected_chars):
     
     return normalized_plate_text
 
+def clean_egyptian_plate(raw_text):
+    """
+    Sanitizes OCR output using Regular Expressions.
+    Enforces strict alphanumeric constraints to eliminate noise and hallucinations.
+    """
+    # Remove special characters, English letters, and Arabic elongation (Tatweel)
+    clean_text = re.sub(r'[^\u0600-\u06FF0-9]', '', raw_text).replace('ـ', '')
+    
+    letters = re.findall(r'[\u0600-\u06FF]', clean_text)
+    numbers = re.findall(r'[0-9]', clean_text)
+    
+    # Truncate hallucinated characters based on physical plate limitations
+    if len(letters) > 3:
+        letters = letters[:3]  
+        
+    if len(numbers) > 4:
+        numbers = numbers[:4]  
+        
+    final_plate = " ".join(letters) + " " + "".join(numbers)
+    
+    # Fallback to raw text if regex strips everything (prevents empty returns)
+    if not letters or not numbers:
+        return raw_text 
+        
+    return final_plate.strip()
+
+
+# ==========================================
+# 🤖 3. CORE INFERENCE PIPELINE
+# ==========================================
 
 def extract_plates_from_frame(img):
     """
-    Executes the full AI pipeline: Vehicle detection -> Plate isolation -> Image Enhancement -> OCR.
+    Executes the full End-to-End AI pipeline: 
+    Vehicle detection -> Plate Isolation -> ROI Letterboxing -> OCR Inference -> Data Sanitization.
+    
     Args:
         img (numpy.ndarray): The raw image frame.
     Returns:
@@ -124,6 +175,7 @@ def extract_plates_from_frame(img):
     """
     detected_data = []
     
+    # Step 1: Vehicle Detection (COCO Dataset)
     vehicle_results = vehicle_model.predict(img, classes=[2, 3, 5, 7], conf=0.5, verbose=False)
     vehicles = []
     for r in vehicle_results:
@@ -133,7 +185,8 @@ def extract_plates_from_frame(img):
             v_type = vehicle_model.names[cls_id] 
             vehicles.append({"box": (vx1, vy1, vx2, vy2), "type": v_type})
 
-    plate_results = plate_model.predict(img, conf=0.5, verbose=False)
+    # Step 2: License Plate Detection
+    plate_results = plate_model.predict(img, conf=0.25, imgsz=640, verbose=False)
     
     for plate_result in plate_results:
         boxes = plate_result.boxes
@@ -142,31 +195,26 @@ def extract_plates_from_frame(img):
         for box in boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             
-            if (x2 - x1) < 60 or (y2 - y1) < 20: 
-                continue 
-            
             plate_cx = (x1 + x2) / 2
             plate_cy = (y1 + y2) / 2
             assigned_vehicle_type = "car" 
             
+            # Map the plate to the corresponding vehicle bounding box
             for v in vehicles:
                 vx1, vy1, vx2, vy2 = v["box"]
                 if vx1 <= plate_cx <= vx2 and vy1 <= plate_cy <= vy2:
                     assigned_vehicle_type = v["type"]
                     break
                     
+            # Step 3: ROI Extraction and Pre-processing
             plate_crop = img[y1:y2, x1:x2]
-            plate_crop_zoomed = cv2.resize(plate_crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-            gray_crop = cv2.cvtColor(plate_crop_zoomed, cv2.COLOR_BGR2GRAY)
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            clahe_crop = clahe.apply(gray_crop)
+            final_processed_crop = add_letterbox(plate_crop, target_size=320)
+
+            _, buffer = cv2.imencode('.jpg', final_processed_crop)
+            debug_base64 = base64.b64encode(buffer).decode('utf-8')
             
-            sharpen_kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
-            sharpened_crop = cv2.filter2D(clahe_crop, -1, sharpen_kernel)
-            
-            final_processed_crop = cv2.cvtColor(sharpened_crop, cv2.COLOR_GRAY2BGR)
-            
-            char_results = ocr_model.predict(final_processed_crop, conf=0.25, verbose=False)
+            # Step 4: Character Recognition (OCR)
+            char_results = ocr_model.predict(final_processed_crop, conf=0.40, imgsz=320, verbose=False)
             
             all_chars = []
             for char_result in char_results:
@@ -178,13 +226,18 @@ def extract_plates_from_frame(img):
                     
             if not all_chars: continue
             
+            # Sort characters from right to left (Arabic orientation)
             all_chars.sort(key=lambda item: item['x'], reverse=True)
-            final_plate_text = correct_plate_logic(all_chars)
-            raw_chars = final_plate_text.replace(" ", "")
             
+            # Step 5: Post-processing and Sanitization
+            raw_plate_text = correct_plate_logic(all_chars)
+            final_plate_text = clean_egyptian_plate(raw_plate_text)
+            
+            raw_chars = final_plate_text.replace(" ", "").replace("ـ", "")
+            
+            # Log warnings for plates that bypass standard regex (for MLOps monitoring)
             if not re.match(r'^[\u0600-\u06FF]{1,3}\d{1,4}$', raw_chars): 
-                print(f"⚠️ Plate detected but rejected by Regex: {final_plate_text}")
-                continue 
+                print(f"⚠️ Plate detected but format mismatched regex: {final_plate_text}")
                 
             detected_data.append({
                 "plate": final_plate_text, 
@@ -195,12 +248,8 @@ def extract_plates_from_frame(img):
 
 def process_plate_with_security(plate_data, gate):
     """
-    Validates the detected plate against the security blacklist and updates the gate logs.
-    Args:
-        plate_data (dict): Contains 'plate' and 'type'.
-        gate (str): Gate type ('in' or 'out').
-    Returns:
-        dict: Operational result or security alert.
+    Validates the sanitized plate against the database.
+    Triggers security protocols for blacklisted entities or processes normal entry/exit workflows.
     """
     plate = plate_data["plate"]
     v_type = plate_data["type"]
@@ -223,7 +272,7 @@ def process_plate_with_security(plate_data, gate):
 
 
 # ==========================================
-# 🌐 3. COMPUTER VISION API ENDPOINTS
+# 🌐 4. COMPUTER VISION API ENDPOINTS
 # ==========================================
 
 @app.post("/process_vehicle")
@@ -258,7 +307,7 @@ async def process_vehicle(gate: str = Form(...), file: UploadFile = File(...)):
 
 @app.post("/process_video")
 async def process_video(gate: str = Form(...), file: UploadFile = File(...)):
-    """ Endpoint to process an uploaded video file, applying frame skipping for performance. """
+    """ Endpoint to process an uploaded video file, applying dynamic frame skipping for latency reduction. """
     if gate not in ['in', 'out']:
         return {"status": "error", "message": "Invalid gate type."}
 
@@ -303,7 +352,7 @@ async def process_video(gate: str = Form(...), file: UploadFile = File(...)):
 
 @app.websocket("/ws/live_camera/{gate}")
 async def live_camera(websocket: WebSocket, gate: str):
-    """ Real-time WebSocket endpoint for continuous video stream inference. """
+    """ Real-time WebSocket endpoint for continuous RTSP/Video stream inference. """
     await websocket.accept()
     
     if gate not in ['in', 'out']:
@@ -348,7 +397,7 @@ class SnapshotData(BaseModel):
 
 @app.post("/process_snapshot")
 async def process_snapshot(data: SnapshotData):
-    """ Endpoint to process an image encoded in Base64 (ideal for WebCams/IoT devices). """
+    """ Endpoint to process an image encoded in Base64 (optimized for Edge/IoT devices). """
     if data.gate not in ['in', 'out']:
         return {"status": "error", "message": "Invalid gate type."}
 
@@ -382,13 +431,13 @@ async def process_snapshot(data: SnapshotData):
 
 
 # ==========================================
-# 📊 4. DASHBOARD & SYSTEM ENDPOINTS
+# 📊 5. DASHBOARD & SYSTEM ENDPOINTS
 # ==========================================
 
 @app.get("/")
 def read_root():
     """ Health Check endpoint. """
-    return {"message": "Welcome to OmniBoard ALPR API - Enterprise Edition is Online 🟢"}
+    return {"message": "Welcome to Nexus ALPR API - Enterprise Edition is Online 🟢"}
 
 @app.get("/live_status")
 def get_live_status():
@@ -404,7 +453,7 @@ def get_live_status():
 
 @app.get("/analytics/dashboard")
 def get_dashboard_analytics():
-    """ Aggregates core system analytics for the main dashboard. """
+    """ Aggregates core system analytics for the main React dashboard. """
     return get_full_dashboard_analytics()
 
 @app.get("/visits")
@@ -443,7 +492,7 @@ def analytics_dwell_time():
 
 
 # ==========================================
-# 🛡️ 5. SECURITY & BLACKLIST MANAGEMENT
+# 🛡️ 6. SECURITY & BLACKLIST MANAGEMENT
 # ==========================================
 
 @app.get("/security/blacklist")
@@ -469,7 +518,7 @@ def mark_alerts_as_read():
 
 
 # ==========================================
-# 🌟 6. VIP / SUBSCRIBER MANAGEMENT
+# 🌟 7. VIP / SUBSCRIBER MANAGEMENT
 # ==========================================
 
 class VIPCreate(BaseModel):
@@ -506,12 +555,12 @@ def delete_vip(plate_number: str):
 
 
 # ==========================================
-# 🛠️ 7. ADMIN ACTIONS & GATE CONTROLS
+# 🛠️ 8. ADMIN ACTIONS & GATE CONTROLS
 # ==========================================
 
 @app.post("/admin/manual_entry")
 def admin_manual_entry(plate_number: str = Form(...), vehicle_type: str = Form(...)):
-    """ Allows manual gate override while enforcing blacklist checks. """
+    """ Allows manual gate override (Human-in-the-loop) while enforcing blacklist checks. """
     clean_plate = " ".join(plate_number.split())
     bl_reason = check_blacklist(clean_plate)
     if bl_reason:
@@ -539,7 +588,7 @@ def admin_waive_fee(visit_id: int = Body(...), reason: str = Body(...)):
 
 
 # ==========================================
-# 📈 8. EXPORTS & SYSTEM SETTINGS
+# 📈 9. EXPORTS & SYSTEM SETTINGS
 # ==========================================
 
 @app.get("/analytics/export")
@@ -559,7 +608,7 @@ def export_report():
         writer.writerow(row[:6])
         
     response = StreamingResponse(iter([stream.getvalue()]), media_type="text/csv")
-    response.headers["Content-Disposition"] = "attachment; filename=omniboard_daily_report.csv"
+    response.headers["Content-Disposition"] = "attachment; filename=nexus_daily_report.csv"
     return response
 
 class SettingsModel(BaseModel):
