@@ -83,10 +83,17 @@ To run Nexus ALPR locally for development or testing:
 - Node.js 18+
 - PostgreSQL Database (Local or Cloud URL)
 
-### 2. Backend Setup
+### 2. 📥 Download AI Models (MLOps Best Practice)
+Due to GitHub's file size limitations and standard MLOps practices, the trained AI weights are hosted separately on Hugging Face.
+
+Download the models from: https://abdelkareem1-nexus-alpr-api.hf.space
+
+Place the downloaded files (plate_model.onnx and ocr_model.onnx) inside the /models directory in the root of the project.
+
+### 3. Backend Setup
 ```bash
 # Clone the repository
-git clone [https://github.com/YOUR_USERNAME/nexus-alpr.git](https://github.com/YOUR_USERNAME/nexus-alpr.git)
+git clone https://github.com/abdelkareemahmed/Nexus-ALPR.git
 cd nexus-alpr
 
 # Create and activate virtual environment
@@ -104,7 +111,7 @@ pip install -r requirements.txt
 uvicorn main:app --reload --port 7860
 ```
 
-### 3. Frontend Setup
+### 4. Frontend Setup
 ```bash
 # Open a new terminal and navigate to frontend
 cd frontend
