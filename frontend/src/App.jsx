@@ -546,6 +546,41 @@ function ModalPortal({ children }) {
   return ReactDOM.createPortal(children, document.body);
 }
 
+function PortalDropdown({ anchorEl, onClose, children }) {
+  const dropRef = useRef(null);
+  const [style, setStyle] = useState({});
+
+  useEffect(() => {
+    if (!anchorEl) return;
+    const r = anchorEl.getBoundingClientRect();
+    setStyle({
+      position: "fixed",
+      top: r.bottom + 4,
+      left: r.right,
+      transform: "translateX(-100%)",
+      zIndex: 99998,
+      minWidth: 190,
+    });
+  }, [anchorEl]);
+
+  useEffect(() => {
+    if (!anchorEl) return;
+    function handleMouseDown(e) {
+      if (dropRef.current && !dropRef.current.contains(e.target) && !anchorEl.contains(e.target)) {
+        onClose();
+      }
+    }
+    document.addEventListener("mousedown", handleMouseDown);
+    return () => document.removeEventListener("mousedown", handleMouseDown);
+  }, [anchorEl, onClose]);
+
+  if (!anchorEl) return null;
+  return ReactDOM.createPortal(
+    <div ref={dropRef} className="filter-dropdown" style={style}>{children}</div>,
+    document.body,
+  );
+}
+
 function Modal({ open, onClose, title, danger = false, children }) {
   // Lock body scroll whenever this modal is open to prevent scrolling behind the overlay
   useEffect(() => {
@@ -1280,17 +1315,7 @@ function PageOverview() {
 
   // ── Actions dropdown ──────────────────────────────────────────────────────
   const [openActionRow, setOpenActionRow] = useState(null);
-  const actionContainerRef               = useRef(null);
-
-  // Close the actions dropdown when clicking outside
-  useEffect(() => {
-    function handleOutside(e) {
-      if (actionContainerRef.current && !actionContainerRef.current.contains(e.target))
-        setOpenActionRow(null);
-    }
-    document.addEventListener("mousedown", handleOutside);
-    return () => document.removeEventListener("mousedown", handleOutside);
-  }, []);
+  const [dropAnchorEl,  setDropAnchorEl]  = useState(null);
 
   // ── Individual stat fetchers (each independently loading-guarded) ──────────
   const fetchAnalytics = useCallback(async () => {
@@ -1789,7 +1814,7 @@ const fetchOccupancy = useCallback(async () => {
         )}
 
         {/* Table */}
-        <div style={{ overflowX:"auto" }} ref={actionContainerRef}>
+        <div style={{ overflowX:"auto" }}>
           <table style={{ width:"100%", borderCollapse:"collapse" }}>
             <thead>
               <tr>
@@ -1868,67 +1893,73 @@ const fetchOccupancy = useCallback(async () => {
                           <button
                             className="btn btn-ghost btn-sm"
                             style={{ padding:"5px 8px" }}
-                            onClick={() => setOpenActionRow(rowOpen ? null : rowKey)}
+                            onClick={(e) => {
+                              if (rowOpen) { setOpenActionRow(null); setDropAnchorEl(null); }
+                              else { setOpenActionRow(rowKey); setDropAnchorEl(e.currentTarget); }
+                            }}
                             title="Manage visit"
                           >
                             <MoreVertical size={14}/>
                           </button>
 
-                          {rowOpen && (
-                            <div className="filter-dropdown" style={{ right:0, minWidth:190, zIndex:300 }}>
+                          <PortalDropdown
+                            anchorEl={rowOpen ? dropAnchorEl : null}
+                            onClose={() => { setOpenActionRow(null); setDropAnchorEl(null); }}
+                          >
+                            {/* A — Edit Visit */}
+                            <button
+                              className="filter-option"
+                              onClick={() => {
+                                setEditRow(row);
+                                setEditForm({
+                                  plate_number: row.plate ?? row.plate_number ?? "",
+                                  vehicle_type: (row.vehicle_type ?? "car").toLowerCase(),
+                                  status:       (row.status ?? "inside").toLowerCase(),
+                                });
+                                setEditError("");
+                                setOpenActionRow(null);
+                                setDropAnchorEl(null);
+                              }}
+                            >
+                              <Pencil size={13} color={T.accent}/> Edit Visit
+                            </button>
 
-                              {/* A — Edit Visit */}
-                              <button
-                                className="filter-option"
-                                onClick={() => {
-                                  setEditRow(row);
-                                  setEditForm({
-                                    plate_number: row.plate ?? row.plate_number ?? "",
-                                    vehicle_type: (row.vehicle_type ?? "car").toLowerCase(),
-                                    status:       (row.status ?? "inside").toLowerCase(),
-                                  });
-                                  setEditError("");
-                                  setOpenActionRow(null);
-                                }}
-                              >
-                                <Pencil size={13} color={T.accent}/> Edit Visit
-                              </button>
+                            {/* B — Void Visit */}
+                            <button
+                              className="filter-option"
+                              style={{ color:T.red }}
+                              onClick={() => {
+                                setVoidRow(row);
+                                setVoidReason("");
+                                setVoidError("");
+                                setOpenActionRow(null);
+                                setDropAnchorEl(null);
+                              }}
+                            >
+                              <Trash2 size={13} color={T.red}/> Void Visit
+                            </button>
 
-                              {/* B — Void Visit */}
-                              <button
-                                className="filter-option"
-                                style={{ color:T.red }}
-                                onClick={() => {
-                                  setVoidRow(row);
-                                  setVoidReason("");
-                                  setVoidError("");
-                                  setOpenActionRow(null);
-                                }}
-                              >
-                                <Trash2 size={13} color={T.red}/> Void Visit
-                              </button>
-
-                              {/* C — Waive Fee (greyed out when ineligible) */}
-                              <button
-                                className="filter-option"
-                                style={{
-                                  color:   canWaive ? T.yellow : T.textFaint,
-                                  opacity: canWaive ? 1 : 0.45,
-                                  cursor:  canWaive ? "pointer" : "not-allowed",
-                                }}
-                                onClick={() => {
-                                  if (!canWaive) return;
-                                  setWaiveRow(row);
-                                  setWaiveReason("");
-                                  setWaiveError("");
-                                  setOpenActionRow(null);
-                                }}
-                                title={!canWaive ? "Only available for outside vehicles with a fee" : undefined}
-                              >
-                                <Banknote size={13} color={canWaive ? T.yellow : T.textFaint}/> Waive Fee
-                              </button>
-                            </div>
-                          )}
+                            {/* C — Waive Fee (greyed out when ineligible) */}
+                            <button
+                              className="filter-option"
+                              style={{
+                                color:   canWaive ? T.yellow : T.textFaint,
+                                opacity: canWaive ? 1 : 0.45,
+                                cursor:  canWaive ? "pointer" : "not-allowed",
+                              }}
+                              onClick={() => {
+                                if (!canWaive) return;
+                                setWaiveRow(row);
+                                setWaiveReason("");
+                                setWaiveError("");
+                                setOpenActionRow(null);
+                                setDropAnchorEl(null);
+                              }}
+                              title={!canWaive ? "Only available for outside vehicles with a fee" : undefined}
+                            >
+                              <Banknote size={13} color={canWaive ? T.yellow : T.textFaint}/> Waive Fee
+                            </button>
+                          </PortalDropdown>
                         </div>
                       </td>
                     </tr>
