@@ -556,8 +556,7 @@ function PortalDropdown({ anchorEl, onClose, children }) {
     setStyle({
       position: "fixed",
       top: r.bottom + 4,
-      left: r.right,
-      transform: "translateX(-100%)",
+      right: window.innerWidth - r.right,
       zIndex: 99998,
       minWidth: 190,
     });
